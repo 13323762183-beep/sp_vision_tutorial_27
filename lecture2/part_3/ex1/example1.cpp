@@ -4,7 +4,7 @@
 int main()
 {
     // 1. 读取图片，路径相对于"运行目录"（build 文件夹）
-    cv::Mat img = cv::imread("assets/demo.jpg");
+    cv::Mat img = cv::imread("assets/demo.jpeg");
 
     // 2. 检查是否读取成功
     if (img.empty())

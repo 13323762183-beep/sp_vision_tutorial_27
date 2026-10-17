@@ -5,7 +5,7 @@ int main()
 {
     // 图像在 OpenCV 中就是 Mat 类的对象：
     // 一行代码完成构造，Mat 帮你管理图像内存（这就是封装！）
-    cv::Mat img = cv::imread("assets/demo.jpg");
+    cv::Mat img = cv::imread("assets/demo.jpeg");
 
     if (img.empty())
     {
