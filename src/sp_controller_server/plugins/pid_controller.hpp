@@ -36,6 +36,13 @@ private:
   rclcpp::Node::SharedPtr node_;
   nav_msgs::msg::Path global_plan_;
   std::string base_frame_id_;
+
+  // 第一版 P 控制器参数
+  double kp_ = 1.5;
+  double linear_speed_ = 0.2;
+  double max_angular_speed_ = 0.8;
+  double lookahead_distance_ = 0.35;
+  double goal_tolerance_ = 0.15;
 };
 
 }
