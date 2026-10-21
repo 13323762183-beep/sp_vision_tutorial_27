@@ -87,6 +87,10 @@ void PidController::configure(
   predict_dt_ = optional_param<double>(node_, p + "predict_dt", predict_dt_);
   turn_rate_max_ = optional_param<double>(node_, p + "turn_rate_max", turn_rate_max_);
   dir_adapt_gain_ = optional_param<double>(node_, p + "dir_adapt_gain", dir_adapt_gain_);
+  decouple_tracking_ = optional_param<bool>(node_, p + "decouple_tracking", decouple_tracking_);
+  dec_kp_ = optional_param<double>(node_, p + "dec_kp", dec_kp_);
+  dec_kd_ = optional_param<double>(node_, p + "dec_kd", dec_kd_);
+  dec_vmax_ = optional_param<double>(node_, p + "dec_vmax", dec_vmax_);
   publish_marker_ = optional_param<bool>(node_, p + "publish_marker", publish_marker_);
 
   marker_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -102,16 +106,20 @@ void PidController::configure(
   dec_acc_ = std::max(0.1, dec_acc_);
   smooth_passes_ = std::clamp(smooth_passes_, 0, 8);
   ref_dev_tol_ = std::max(0.1, ref_dev_tol_);
+  dec_kp_ = std::max(0.0, dec_kp_);
+  dec_kd_ = std::max(0.0, dec_kd_);
+  dec_vmax_ = std::clamp(dec_vmax_, 0.05, max_linear_vel_);
 
   RCLCPP_INFO(node_->get_logger(),
     "[%s] PidController configured: v_max=%.2f lat_acc=%.2f dec=%.2f look=[%.2f,%.2f]+%.2f*v "
     "tol=%.2f smooth=%d fine=%d ref_dev=%.2f lat=%.2f/%.2f pred=%.2f turn=%.2f adapt=%.2f "
-    "base_frame=%s",
+    "decouple=%d kp=%.2f kd=%.2f vn_max=%.2f base_frame=%s",
     plugin_name_.c_str(), max_linear_vel_, lat_acc_, dec_acc_,
     lookahead_min_, lookahead_max_, lookahead_gain_,
     goal_tolerance_, smooth_passes_, fine_traj_ ? 1 : 0, ref_dev_tol_, lat_gain_, lat_damp_, predict_dt_,
     turn_rate_max_,
     dir_adapt_gain_,
+    decouple_tracking_ ? 1 : 0, dec_kp_, dec_kd_, dec_vmax_,
     base_frame_id_.c_str());
 }
 
@@ -502,47 +510,72 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
     return cmd_vel;
   }
 
-  double dir = std::atan2(uy, ux);
+  // ---------------- 生成 map 系速度 (mx, my) ----------------
+  double mx = 0.0;
+  double my = 0.0;
 
-  // 横向误差反馈（PD）：纯跟踪 + 执行器滞后会形成极限环（画龙）。
-  // e 是横向偏差，e_dot 是实测横向速度，两者一起构成阻尼项。
-  if (lat_gain_ > 0.0 || lat_damp_ > 0.0) {
-    const double e_dot = velocity.linear.x * nx + velocity.linear.y * ny;
-    const double v_scale = std::max(v_cmd, 0.30);
-    double corr = -(lat_gain_ * e_lat + lat_damp_ * e_dot) / v_scale;
-    corr = std::clamp(corr, -0.50, 0.50);
-    dir += corr;
+  if (decouple_tracking_) {
+    // 全向解耦：横向误差直接给「法向平移速度」，不再折算成航向角。
+    // 折算成角度的做法是纯跟踪的遗留：车会“朝左前方冲 → 冲过头 → 朝右前方冲”，
+    // 轨迹上就是 S 型画龙。全向底盘本来就能横着走，横向偏差就该横向修。
+    const double tan_x = ny;    // 投影点切向（projectOntoPath 返回法向 n=(-ty,tx)）
+    const double tan_y = -nx;
+    const double v_n_meas = velocity.linear.x * nx + velocity.linear.y * ny;  // 实测横向速度
+    double v_n = -(dec_kp_ * e_lat + dec_kd_ * v_n_meas);
+    v_n = std::clamp(v_n, -dec_vmax_, dec_vmax_);
+    // 切向速度按勾股补偿：横向纠偏不额外拖慢沿路径的前进速度
+    const double v_t = std::sqrt(std::max(0.0, v_cmd * v_cmd - v_n * v_n));
+    mx = v_t * tan_x + v_n * nx;
+    my = v_t * tan_y + v_n * ny;
+  } else {
+    // ---- 原纯跟踪方向角修正（decouple_tracking:=false 时走这里）----
+    double dir = std::atan2(uy, ux);
+
+    // 横向误差反馈（PD）：纯跟踪 + 执行器滞后会形成极限环（画龙）。
+    // e 是横向偏差，e_dot 是实测横向速度，两者一起构成阻尼项。
+    if (lat_gain_ > 0.0 || lat_damp_ > 0.0) {
+      const double e_dot = velocity.linear.x * nx + velocity.linear.y * ny;
+      const double v_scale = std::max(v_cmd, 0.30);
+      double corr = -(lat_gain_ * e_lat + lat_damp_ * e_dot) / v_scale;
+      corr = std::clamp(corr, -0.50, 0.50);
+      dir += corr;
+    }
+
+    // 方向偏差自适应：底盘实际速度方向相对指令有系统性偏差时自动抵消
+    if (dir_adapt_gain_ > 0.0) {
+      dir -= dir_bias_;
+    }
+
+    // 指令方向限速：底盘转向有滞后，别让它追一个转得太快的指令
+    double dt = 0.02;
+    if (last_cmd_stamp_.nanoseconds() != 0) {
+      dt = std::clamp((now - last_cmd_stamp_).seconds(), 0.001, 0.2);
+    }
+    last_cmd_stamp_ = now;
+    if (turn_rate_max_ > 0.0 && has_last_ang_) {
+      const double step = std::clamp(wrapAngle(dir - last_cmd_ang_),
+          -turn_rate_max_ * dt, turn_rate_max_ * dt);
+      dir = last_cmd_ang_ + step;
+    }
+    has_last_ang_ = true;
+
+    // 观测器：实测方向 - 指令方向（应该在 0 附近；有系统偏差就补掉）
+    if (dir_adapt_gain_ > 0.0 && v_cmd > 0.35 &&
+      std::hypot(velocity.linear.x, velocity.linear.y) > 0.25)
+    {
+      const double act_ang = std::atan2(velocity.linear.y, velocity.linear.x);
+      const double e = wrapAngle(act_ang - dir);
+      dir_bias_ += dir_adapt_gain_ * wrapAngle(e - dir_bias_);
+      dir_bias_ = std::clamp(dir_bias_, -0.6, 0.6);
+    }
+    last_cmd_ang_ = dir;
+
+    mx = std::cos(dir) * v_cmd;
+    my = std::sin(dir) * v_cmd;
   }
 
-  // 方向偏差自适应：底盘实际速度方向相对指令有系统性偏差时自动抵消
-  if (dir_adapt_gain_ > 0.0) {
-    dir -= dir_bias_;
-  }
-
-  // 指令方向限速：底盘转向有滞后，别让它追一个转得太快的指令
-  double dt = 0.02;
-  if (last_cmd_stamp_.nanoseconds() != 0) {
-    dt = std::clamp((now - last_cmd_stamp_).seconds(), 0.001, 0.2);
-  }
-  last_cmd_stamp_ = now;
-  if (turn_rate_max_ > 0.0 && has_last_ang_) {
-    const double step = std::clamp(wrapAngle(dir - last_cmd_ang_),
-        -turn_rate_max_ * dt, turn_rate_max_ * dt);
-    dir = last_cmd_ang_ + step;
-  }
-  has_last_ang_ = true;
-
-  const double cmd_speed = v_cmd;
+  const double cmd_speed = std::hypot(mx, my);
   const double meas_speed = std::hypot(velocity.linear.x, velocity.linear.y);
-
-  // 观测器：实测方向 - 指令方向（应该在 0 附近；有系统偏差就补掉）
-  if (dir_adapt_gain_ > 0.0 && v_cmd > 0.35 && meas_speed > 0.25) {
-    const double act_ang = std::atan2(velocity.linear.y, velocity.linear.x);
-    const double e = wrapAngle(act_ang - dir);
-    dir_bias_ += dir_adapt_gain_ * wrapAngle(e - dir_bias_);
-    dir_bias_ = std::clamp(dir_bias_, -0.6, 0.6);
-  }
-  last_cmd_ang_ = dir;
 
   // ---------- 卡住保护：命令有速度但实际几乎不动 -> 沿路径倒车一下 ----------
   if (stuck_state_ == 0) {
@@ -581,20 +614,17 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
     }
   }
 
-  ux = std::cos(dir);
-  uy = std::sin(dir);
-
   // map 系速度 -> base_link 系（底盘全向，直接旋转即可）
   const double c = std::cos(yaw);
   const double s = std::sin(yaw);
-  cmd_vel.twist.linear.x = (c * ux + s * uy) * v_cmd;
-  cmd_vel.twist.linear.y = (-s * ux + c * uy) * v_cmd;
+  cmd_vel.twist.linear.x = c * mx + s * my;
+  cmd_vel.twist.linear.y = -s * mx + c * my;
   cmd_vel.twist.linear.z = 0.0;
   cmd_vel.twist.angular.z = 0.0;
 
   RCLCPP_DEBUG(node_->get_logger(),
     "[%s] s=%.2f/%.2f v=%.2f look=%.2f dir=%.2f bias=%.2f cmd=(%.2f, %.2f) yaw=%.2f",
-    plugin_name_.c_str(), s_now, s_.back(), v_cmd, look, dir, dir_bias_,
+    plugin_name_.c_str(), s_now, s_.back(), v_cmd, look, std::atan2(my, mx), dir_bias_,
     cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, yaw);
 
   publishMarkers(pose, cmd_vel, yaw);

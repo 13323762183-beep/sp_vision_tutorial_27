@@ -49,16 +49,24 @@ controller_server:
       lookahead_gain: 0.15    # 前视距离 = min + gain * v
       # --- 参考路径稳定性 ---
       ref_dev_tol: 0.60       # 新规划偏离参考路径超过该值才换参考（抑制 10Hz 重规划抖动）
-      lat_gain: 0.0           # 横向误差 P（实测加大会振荡，默认关；纯跟踪已够）
-      lat_damp: 0.0           # 横向速度 D（实测速度有滞后，D 变反阻尼，默认关）
-      predict_dt: 0.15        # 位置预测时间 s（补偿底盘速度响应滞后，抑制摆动）
-      # --- 可选增强（0=关闭）---
-      turn_rate_max: 0.0      # 指令方向最大转速 rad/s（0=不限）
+      # --- 全向解耦跟踪（默认启用，决定路径跟踪精度）---
+      # 横向误差不再折算成航向角，而是直接给一个「法向平移速度」。
+      # 全向底盘能横着走，横向偏差就该横向修，这样才不会 S 型画龙。
+      decouple_tracking: true # true=解耦（推荐）；false=退回纯跟踪方向角修正
+      dec_kp: 2.0             # 法向速度 = -(kp*e_lat + kd*v_n)，横向误差 P
+      dec_kd: 0.35            # 横向速度阻尼 D（补偿底盘速度滞后）
+      dec_vmax: 0.60          # 法向纠偏速度上限 m/s
+      # --- 以下三项只在 decouple_tracking:=false 时生效（保留做对比）---
+      lat_gain: 0.0           # 横向误差 P（折成航向角，实测加大会振荡）
+      lat_damp: 0.0           # 横向速度 D（折成航向角，实测有害）
       dir_adapt_gain: 0.10    # 方向偏差自适应增益（抵消底盘系统性方向偏差）
+      # --- 通用 ---
+      predict_dt: 0.15        # 位置预测时间 s（补偿底盘速度响应滞后，抑制摆动）
+      turn_rate_max: 0.0      # 指令方向最大转速 rad/s（0=不限）
       goal_tolerance: 0.05    # 距路径终点小于该值输出零速，稳稳停住
       min_speed: 0.05         # 速度剖面下限，避免原地不动
       smooth_passes: 2        # 平滑迭代次数（圆角化直角弯）
-      fine_traj: false        # 精细轨迹模式（加分项）：Chaikin+重采样+三点曲率；窄通道直角弯下默认关
+      fine_traj: false        # 精细轨迹模式：Chaikin+重采样+三点曲率；窄通道直角弯下默认关
       publish_marker: true    # 发布 /controller_marker（车体 + 速度箭头）
 
 

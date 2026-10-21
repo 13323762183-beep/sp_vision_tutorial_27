@@ -33,7 +33,9 @@ struct Point2d
  *      得到沿路径的期望速度剖面 v(s)；
  *   3. 每个控制周期在路径上取当前投影点前方 L = v * T 处的引导点，
  *      速度方向指向引导点，幅值取 v(s)；
- *   4. 把 map 系下的速度旋到 base_link 系后下发。
+ *   4. map 系下把速度分解成「切向 + 法向」两路：切向走 v(s)，法向用横向误差
+ *      的 PD 直接纠偏（全向底盘能横着走，不需要把横向误差折成航向角）；
+ *   5. 把 map 系下的速度旋到 base_link 系后下发。
  */
 class PidController : public sp_controller_server::ControllerPlugin {
 public:
@@ -88,6 +90,12 @@ protected:
   double predict_dt_{0.15};         // 位置预测时间（补偿底盘速度响应滞后），0=关闭
   double turn_rate_max_{0.0};       // 指令方向最大转速 rad/s（0=不限）
   double dir_adapt_gain_{0.0};      // 方向偏差自适应增益（0=关闭）
+
+  // ---- 全向解耦跟踪（横向误差 -> 法向平移速度，而不是折成航向角）----
+  bool decouple_tracking_{true};    // true=切向+法向解耦；false=退回纯跟踪方向角修正
+  double dec_kp_{2.0};              // 法向速度 = -(kp*e_lat + kd*v_n_meas)
+  double dec_kd_{0.35};
+  double dec_vmax_{0.60};           // 法向纠偏速度上限 m/s
 
   // ---- 参考路径（固定，不被 10Hz 重规划的抖动带着走）----
   std::vector<Point2d> raw_pts_;
