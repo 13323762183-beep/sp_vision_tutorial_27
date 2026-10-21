@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 project(sp_controller_server)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -11,6 +13,7 @@ find_package(pluginlib REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 include_directories(include)
 add_library(controller_server_core SHARED
   src/controller_server.cpp
@@ -36,6 +39,7 @@ ament_target_dependencies(controller_plugins
   pluginlib
   tf2_ros
   tf2_geometry_msgs
+  visualization_msgs
 )
 pluginlib_export_plugin_description_file(sp_controller_server plugin_description.xml)
 add_executable(controller_node src/controller_node.cpp)

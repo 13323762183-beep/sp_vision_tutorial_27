@@ -1,144 +1,100 @@
 # 27算法组导航方向招新大作业
 
-## 0\. 环境配置
 
-```Plain Text
-// 已装 Ubuntu 22.04 和 ROS2 Humble
-sudo apt update
-sudo apt install -y \
-  python3-colcon-common-extensions \
-  python3-rosdep \
-  ros-humble-pluginlib \
-  ros-humble-tf2-ros \
-  ros-humble-tf2-geometry-msgs \
-  ros-humble-nav-msgs \
-  ros-humble-std-srvs \
-  ros-humble-rviz2 \
-  ros-humble-behaviortree-cpp-v3 \
-  qtbase5-dev \
-  libopencv-dev \
-  libyaml-cpp-dev
-  
-pip3 install --user pygame numpy Pillow
+在给定的迷宫地图上完成「一次点击导航」全流程：
+**RViz 点一个终点 → 上层行为树触发导航 → A\* 规划全局路径 → 本仓库实现的控制器插件跟踪路径 → 小车平稳到达终点。**
+
+1. **实现路径跟踪控制器插件** —— `sp_controller_server/plugins/pid_controller.cpp`
+   （`configure` / `setPlan` / `computeVelocityCommands` 三个接口）；
+2. **补全运行所需参数** —— `sp_nav_bringup/config/nav_params.yaml`
+   （ESDF / 规划器 / 控制器三组参数原本全为空，直接运行会因 `[参数缺失]` 抛异常退出）。
+
+## 1. 系统架构与数据流
+
+```
+                     RViz "2D Goal Pose"
+                             │ /goal_pose
+                             ▼
+   ┌──────────────────────────────────────────┐
+   │ sp_decision  上层行为树 click_nav.xml     │
+   └──────────────────┬───────────────────────┘
+                      │ NavigateToPose (Action)
+                      ▼
+   ┌──────────────────────────────────────────┐
+   │ sp_nav_bt  下层行为树                     │  20Hz 取位姿，10Hz 重规划，
+   │ default_nav_with_fallback.xml             │  剩距 <0.3m 判定到达
+   └───────┬───────────────────────┬──────────┘
+           │ make_plan (srv)        │ set_control_enable (srv)
+           ▼                        ▼
+ ┌───────────────────┐      ┌────────────────────────────┐
+ │ sp_global_planner │      │ sp_controller_server       │
+ │ A* → /global_path │─────▶│ 加载 PidController 插件    │
+ └─────────▲─────────┘      │ 50Hz 计算 cmd_vel          │
+           │ /global_costmap │                            │
+           │ /local_costmap  └──────────┬─────────────────┘
+ ┌─────────┴─────────┐                 │ /sentry/cmd_vel
+ │ sp_map_server     │      ┌──────────▼─────────────────┐
+ │ ESDF 代价地图     │      │ sp_nav_sim 拖拽仿真        │
+ └───────────────────┘      │ /Odometry + TF             │
+                            └────────────────────────────┘
 ```
 
-## 1\. 作业目标
+* TF：`map --(静态)--> lidar_odom --(动态)--> base_link`
+* 控制器输出 `TwistStamped`（`base_link` 系），`controller_server` 取 `twist` 发布到 `/sentry/cmd_vel`。
+  全向底盘只吃 `linear.x / linear.y`，故 `angular.z` 恒为 0。
 
-在给定的迷宫地图上，完成 **一次点击导航** 全流程：
+## 2. 环境与编译
 
-1. 机器人从 **固定起点** 出发；
+```bash
+# Ubuntu 22.04 + ROS 2 Humble
+sudo apt update
+sudo apt install -y python3-colcon-common-extensions python3-rosdep \
+  ros-humble-pluginlib ros-humble-tf2-ros ros-humble-tf2-geometry-msgs \
+  ros-humble-nav-msgs ros-humble-std-srvs ros-humble-rviz2 \
+  ros-humble-behaviortree-cpp-v3 qtbase5-dev libopencv-dev libyaml-cpp-dev
+pip3 install --user pygame numpy Pillow
 
-2. 选手在 RViz 中对 **指定终点** 发布一次目标；
+cd <仓库根目录>
+colcon build --symlink-install && source install/setup.bash
 
-3. 上层行为树 `click_nav.xml` 触发导航；
+bash bash/sim_nav_all_start.sh
 
-4. 下层行为树 `default_nav_with_fallback.xml` 调用 A\* 规划全局路径；
+### 4.2 四个关键设计
 
-5. **你实现的控制器插件** 跟踪规划轨迹，使机器人准确、平滑地到达终点。
+**(1) 稳定参考路径 + 进度索引**（最关键的一处改动）
 
-## 2\. 任务场景
+上层行为树每 100 ms 用**当前栅格中心**作起点重规划一次。如果控制器每次都采信这条新路径，前视点会在相邻两个栅格中心之间来回跳（±5 cm ≈ ±10° 方向噪声），喂给一个有滞后的底盘就是持续摆动。
 
-### 2\.1 地图
+因此控制器把**第一次规划的路径固化为参考路径**，之后的重规划只有在"偏离超过 `ref_dev_tol`（默认 0.60 m，说明真的换了路线）"时才替换；投影时只在进度索引附近（前 6 m / 后 1 m）窗口搜索，既快又不会跳到路径的另一段。
 
-|项目|数值|
-|---|---|
-|文件|`maze_map.pgm` / `maze_map.yaml`|
-|分辨率|`0.05 m/pixel`|
-|尺寸|`15.00 m × 15.00 m`（300×300）|
-|走廊宽度|约 `1.50 m`|
-|墙厚|约 `0.15 m`<br>|
+**(2) 曲率限速 + 刹车反传的速度剖面**
 
-<p align="center">
-  <img src="images/image_1.png" alt="仿真 GUI" width="420" />
-  <img src="images/image_2.png" alt="代价地图与全局路径" width="420" />
-</p>
+$$
+\kappa_i=\frac{|\Delta\theta_i|}{\tfrac12(l_{i-1}+l_i)},\qquad
+v^{\text{lat}}_i=\min\left(v_{\max},\ \sqrt{a_{\text{lat}}/\kappa_i}\right)
+$$
 
-### 2\.2 固定起终点
+$$
+v_i=\min\left(v^{\text{lat}}_i,\ \sqrt{v_{i+1}^{2}+2a_{\text{dec}}\Delta s_i}\right),\qquad v_{\text{end}}=0
+$$
 
-||**map 系坐标 \(x, y\)**|**说明**|
-|---|---|---|
-|**起点**|`(0.900, 0.900)`|迷宫左下角通路中心；仿真初始位置已设为此处|
-|**终点**|`(14.100, 14.100)`|迷宫右上角通路中心；评测时只允许对该点 click 一次|
+弯道按 `a_lat` 限速，再用刹车约束从终点反向传播，保证每一点都来得及减速，末端自然收敛停车。
+路径先做 2 次 `[1/4, 1/2, 1/4]` 平滑，把栅格的直角弯圆角化。
 
-- **不允许拖拽改起点、不允许中途二次改目标；**
+**(3) 纯跟踪 + 滞后预测**
 
-- **不允许手动发布 ****`cmd_vel`**** 绕过控制器。**
+取路径前方 `L = clamp(0.30 + 0.15v, 0.30, 0.50)` 处的引导点，方向指向它；
+控制点不直接用当前位姿，而是用实测速度前推 `predict_dt = 0.15 s`：
 
-### 2\.3 仿真器
+$$
+p_{\text{ctrl}} = p + v_{\text{meas}}\cdot \Delta t_{\text{pred}}
+$$
 
-- **不允许修改仿真器内部代码及参数；**
+这一项补偿掉底盘的速度响应滞后，实测平均跟踪误差从 0.139 m 降到 0.095 m。
 
-- **仿真里机器人撞墙便会卡住。**
+**(4) 卡住脱困（兜底）**
+命令 >0.5 m/s 而实测 <0.08 m/s 持续 2 s → 沿路径反方向倒车 0.9 s；**一次任务最多 3 次**，防止"蹭墙→倒车→再蹭"的死循环。
 
-## 3\. 发放内容与你需要完成的部分
+最后把 map 系速度旋到车体系：`vx_b = cos(yaw)*ux + sin(yaw)*uy`，`vy_b = -sin(yaw)*ux + cos(yaw)*uy`。
+`yaw` 每周期都从 TF 重读（仿真里云台以 1 rad/s 匀速扫描，缓存 yaw 会直接跑飞）。
 
-### 3\.1 发放给你的代码
-
-|包|内容|
-|---|---|
-|`robot_msg`|消息 / Action|
-|`sp_map_server`|ESDF / 全局代价地图|
-|`sp_global_planner`|A\* 全局规划|
-|`sp_nav_bt`|下层 BT：`default_nav_with_fallback.xml`|
-|`sp_decision`|上层 BT：`click_nav.xml`|
-|`sp_nav_bringup`|启动与地图（含 `maze_map`）|
-|`sp_nav_sim`|拖拽仿真（里程计 \+ TF）|
-|`sp_controller_server`|控制器框架（`ControllerPlugin` 接口、`controller_node`、pluginlib 加载）|
-
-控制器侧（名称可自定，但须 pluginlib 可加载）：
-
-- `include/sp_controller_server/controller_plugin.hpp`（接口，只读）
-
-- `plugins/<你的控制器>.hpp/.cpp`（由你实现）
-
-- `plugin_description.xml`、`CMakeLists.txt`（需正确注册插件）
-
-- `launch/controller.launch.py`
-
-**注意：代码中已给出 PidController（\.cpp 与 \.hpp）的大体框架，可直接在此基础上修改。**
-
-### 3\.2 你必须完成的工作（代码中已用 TODO 标明）
-
-1. **实现路径跟踪控制器插件**
-
-实现 `ControllerPlugin` 三个接口：
-
-- `configure(...)`：读参数、初始化
-
-- `setPlan(path)`：接收 `/global_path`（经 controller server 转发）
-
-- `computeVelocityCommands(pose, velocity)`：输出 `TwistStamped`（线速度）
-
-2. **修改参数使工程能在迷宫上跑通**
-
-发放包中部分路径 / 话题 / 坐标系 / 为空，直接运行`sim_nav_all_start.sh`不能正确评测迷宫任务，你需要自行排查并修改。
-
-3. **可视化与代码管理**
-
-在 RViz 中至少清晰展示：全局代价地图、全局路径、机器人位姿、目标点等；代码要有清晰的 commit 记录，知道该忽略哪些文件。
-
-## 4\. 评分标准（100 分）
-
-**评测方式：固定起点 → 一次 click 到固定终点 → 记录从目标下发到判定到达的过程。**
-
-|**分项**|**分值**|**考察内容**|
-|---|---|---|
-|**准确到达**|25|最终位置与终点距离|
-|**时间**|25|从收到目标到到达的用时|
-|**跟踪精度**|20|对采样位姿计算到全局参考路径的误差|
-|**报告**|15|清晰的 README 介绍你的项目|
-|**可视化与代码管理**|15|RViz 地图、路径、机器人清晰；代码管理清晰|
-
-## 5\. 加分项（**不超过总分 100**）
-
-- 轨迹平滑（平滑 A\* 轨迹或直接使用其他算法）；
-
-- 自研优于 PID 的控制器（例如使用 LQR 或 MPC）。
-
-## 6\. 提交要求
-
-- 线上提交到自己的 git 仓库对应分支，需包含完整可编译源码；
-
-- 如虚拟机卡顿且自己无法解决，10\.6后可线下到地下室使用小电脑调试（需提前告知群里导航方向管理员）；
-
-- DDL：10\.25。

@@ -3,6 +3,6 @@
     name="PidController"
     type="pid_controller::PidController"
     base_class_type="sp_controller_server::ControllerPlugin">
-    <description>Student path-tracking controller plugin (skeleton).</description>
+    <description>Pure-pursuit + lag-prediction path tracking controller with curvature-limited speed profile.</description>
   </class>
 </library>
