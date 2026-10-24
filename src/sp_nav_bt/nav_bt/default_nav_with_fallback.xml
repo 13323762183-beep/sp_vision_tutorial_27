@@ -39,7 +39,7 @@
         </Fallback>
       </nav_RateControl>
       <nav_NavStateTrack goal_pose="{goal_pose}"
-                     goal_tolerance="0.3"
+                     goal_tolerance="0.05"
                      remaining_distance="{remaining_distance}"
                      elapsed_time="{elapsed_time}"/>
     </nav_RepeatSequence>

@@ -1,4 +1,4 @@
-# TODO: 在此补全参数
+# 迷宫导航：仿真器、地图和坐标系保持原样。
 planner_server:
   ros__parameters:
     costmap_topic: "/global_costmap"
@@ -18,8 +18,8 @@ esdf_map_publisher:
     frame_id: "map"
     publish_rate_hz: 2.0
     unknown_as_obstacle: false
-    robot_radius: 0.25
-    margin: 0.10
+    robot_radius: 0.36       # 0.5 m 方形自旋底盘的外接圆半径向上取整
+    margin: 0.09             # 覆盖栅格离散误差和跟踪偏差
     d_safe: 0.70
     w: 12.0
     unknown_cost: 0
@@ -33,29 +33,29 @@ controller_server:
     map_frame_id: "map"
     cmd_vel_topic: "/sentry/cmd_vel"
     base_frame_id: "base_link"
-    control_frequency: 50.0
+    control_frequency: 15.0
 
     plugin_name: "PidController"
     plugin_type: "PidController"
 
     PidController:
       base_frame_id: "base_link"
-      # --- 实测标定（本机 WSL Ubuntu22.04 + 仿真器）---
-      max_linear_vel: 1.35    # 底盘带小陀螺自旋时实测可达约 1.38 m/s，别贪
-      lat_acc: 1.8            # 过弯向心加速度上限（过弯速度=sqrt(a_lat/R)），调大实测会切弯撞墙，调小反而易蹭墙
-      dec_acc: 1.2            # 速度剖面刹车减速度
+      # --- 原版仿真完整路线实测：G3 三轮验证---
+      max_linear_vel: 0.8 # 直道速度上限，三轮完整仿真验证
+      lat_acc: 0.35 # 急弯提前减速，降低速度方向切换的滞后
+      dec_acc: 0.45 # 速度剖面刹车减速度
       lookahead_min: 0.30     # 前视距离下限 m
       lookahead_max: 0.50     # 前视距离上限 m
       lookahead_gain: 0.15    # 前视距离 = min + gain * v
       # --- 参考路径稳定性 ---
-      ref_dev_tol: 0.60       # 新规划偏离参考路径超过该值才换参考（抑制 10Hz 重规划抖动）
+      ref_dev_tol: 0.15       # 小幅重规划抖动保持参考；障碍导致路线改变时及时接收
       # --- 全向解耦跟踪（默认启用，决定路径跟踪精度）---
       # 横向误差不再折算成航向角，而是直接给一个「法向平移速度」。
       # 全向底盘能横着走，横向偏差就该横向修，这样才不会 S 型画龙。
       decouple_tracking: true # true=解耦（推荐）；false=退回纯跟踪方向角修正
-      dec_kp: 2.0             # 法向速度 = -(kp*e_lat + kd*v_n)，横向误差 P
-      dec_kd: 0.35            # 横向速度阻尼 D（补偿底盘速度滞后）
-      dec_vmax: 0.60          # 法向纠偏速度上限 m/s
+      dec_kp: 1.6 # 与速度响应带宽匹配，避免过度纠偏
+      dec_kd: 0.25 # 保留阻尼，避免与位置预测叠加后过大
+      dec_vmax: 0.7 # 法向纠偏速度上限 m/s
       # --- 以下三项只在 decouple_tracking:=false 时生效（保留做对比）---
       lat_gain: 0.0           # 横向误差 P（折成航向角，实测加大会振荡）
       lat_damp: 0.0           # 横向速度 D（折成航向角，实测有害）
@@ -63,7 +63,7 @@ controller_server:
       # --- 通用 ---
       predict_dt: 0.15        # 位置预测时间 s（补偿底盘速度响应滞后，抑制摆动）
       turn_rate_max: 0.0      # 指令方向最大转速 rad/s（0=不限）
-      goal_tolerance: 0.05    # 距路径终点小于该值输出零速，稳稳停住
+      goal_tolerance: 0.035   # 小于 BT 的 5 cm 到达阈值
       min_speed: 0.05         # 速度剖面下限，避免原地不动
       smooth_passes: 2        # 平滑迭代次数（圆角化直角弯）
       fine_traj: false        # 精细轨迹模式：Chaikin+重采样+三点曲率；窄通道直角弯下默认关

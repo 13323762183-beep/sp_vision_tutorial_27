@@ -160,6 +160,9 @@ nav_msgs::msg::Path AStarPlanner::createPlan(
 
       int8_t c = map.data[ni];
       if (isBlocked(c)) continue;
+      // 对角移动必须同时满足两侧正交格可通行，禁止从膨胀障碍的角上穿过。
+      if (k >= 4 && (isBlocked(map.data[idx(cx + dxs[k], cy)]) ||
+        isBlocked(map.data[idx(cx, cy + dys[k])]))) continue;
 
       double step = (k < 4) ? 1.0 : std::sqrt(2.0);
 
@@ -210,6 +213,11 @@ nav_msgs::msg::Path AStarPlanner::createPlan(
     path.poses.push_back(ps);
   }
 
+  // 保留用户的精确坐标，避免终点被量化到栅格中心（最大约 3.5 cm）。
+  if (!path.poses.empty()) {
+    path.poses.front().pose = start.pose;
+    path.poses.back().pose = goal.pose;
+  }
   return path;
 }
 

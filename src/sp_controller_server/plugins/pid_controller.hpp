@@ -10,6 +10,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2_ros/buffer.h>
@@ -52,8 +53,15 @@ public:
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & velocity) override;
 
-private:
+protected:
   double distToRef(const Point2d & p) const;
+  bool safePoint(double x, double y) const;
+  bool safeSegment(const Point2d & a, const Point2d & b) const;
+  bool referenceBlocked() const;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_, local_map_sub_;
+  nav_msgs::msg::OccupancyGrid::SharedPtr costmap_, local_costmap_;
+  double local_map_received_{0.0};
+  bool goal_reached_{false};
 
 protected:
   void publishMarkers(

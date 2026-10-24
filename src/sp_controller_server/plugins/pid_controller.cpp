@@ -92,6 +92,15 @@ void PidController::configure(
   dec_kd_ = optional_param<double>(node_, p + "dec_kd", dec_kd_);
   dec_vmax_ = optional_param<double>(node_, p + "dec_vmax", dec_vmax_);
   publish_marker_ = optional_param<bool>(node_, p + "publish_marker", publish_marker_);
+  map_sub_ = node_->create_subscription<nav_msgs::msg::OccupancyGrid>(
+    "/global_costmap", rclcpp::QoS(1),
+    [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {costmap_ = msg;});
+  local_map_sub_ = node_->create_subscription<nav_msgs::msg::OccupancyGrid>(
+    "/local_costmap/costmap", rclcpp::QoS(1),
+    [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+      local_costmap_ = msg;
+      local_map_received_ = node_->now().seconds();
+    });
 
   marker_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
     "/controller_marker", rclcpp::QoS(1));
@@ -132,13 +141,33 @@ void PidController::setPlan(const nav_msgs::msg::Path & path)
     cand.push_back({ps.pose.position.x, ps.pose.position.y});
   }
   if (cand.size() < 2) {
+    raw_pts_.clear();
+    pts_.clear();
+    has_ref_ = false;
+    plan_dirty_ = true;
     return;
+  }
+  for (const auto & pt : cand) {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y)) {
+      pts_.clear();
+      has_ref_ = false;
+      return;
+    }
+  }
+  const bool new_goal = !has_ref_ || raw_pts_.empty() ||
+    std::hypot(cand.back().x - raw_pts_.back().x, cand.back().y - raw_pts_.back().y) > 0.01;
+  if (new_goal) {
+    goal_reached_ = false;
+    escape_count_ = 0;
+    stuck_state_ = 0;
+    has_last_ang_ = false;
+    dir_bias_ = 0.0;
   }
 
   // 参考路径保持稳定：上层每 100ms 从"当前栅格中心"重规划一次，若每次都采信，
   // 前视点会在两格之间来回跳（±5cm -> 约 ±10° 方向噪声），喂给转向有滞后的底盘
   // 就会画龙。只有"真的换了路线"（偏离超过 ref_dev_tol）才更新参考。
-  if (!has_ref_ || planDeviates(cand)) {
+  if (new_goal || planDeviates(cand) || referenceBlocked()) {
     const bool rebuild = has_ref_;
     raw_pts_ = cand;
     plan_dirty_ = true;
@@ -149,6 +178,43 @@ void PidController::setPlan(const nav_msgs::msg::Path & path)
         "[%s] 参考路径更新（新规划偏离超过 %.2f m）", plugin_name_.c_str(), ref_dev_tol_);
     }
   }
+}
+
+bool PidController::safePoint(double x, double y) const
+{
+  auto check = [x, y](const nav_msgs::msg::OccupancyGrid & map, bool outside_ok) {
+      if (map.info.resolution <= 0.0 || map.data.size() !=
+        static_cast<std::size_t>(map.info.width) * map.info.height) return false;
+      const int ix = static_cast<int>(std::floor((x - map.info.origin.position.x) / map.info.resolution));
+      const int iy = static_cast<int>(std::floor((y - map.info.origin.position.y) / map.info.resolution));
+      if (ix < 0 || iy < 0 || ix >= static_cast<int>(map.info.width) ||
+        iy >= static_cast<int>(map.info.height)) return outside_ok;
+      const int cost = map.data[iy * map.info.width + ix];
+      return cost >= 0 && cost < 100;
+    };
+  return costmap_ && check(*costmap_, false) &&
+    (!local_costmap_ || node_->now().seconds() - local_map_received_ > 1.0 ||
+    check(*local_costmap_, true));
+}
+
+bool PidController::safeSegment(const Point2d & a, const Point2d & b) const
+{
+  const int steps = std::max(1, static_cast<int>(std::ceil(std::hypot(b.x-a.x, b.y-a.y) / 0.02)));
+  for (int i = 0; i <= steps; ++i) {
+    const double t = static_cast<double>(i) / steps;
+    if (!safePoint(a.x + t * (b.x-a.x), a.y + t * (b.y-a.y))) return false;
+  }
+  return true;
+}
+
+bool PidController::referenceBlocked() const
+{
+  if (s_.empty()) return true;
+  for (std::size_t i = prog_idx_; i + 1 < pts_.size() &&
+    s_[i] - s_[prog_idx_] < 2.0; ++i) {
+    if (!safeSegment(pts_[i], pts_[i+1])) return true;
+  }
+  return false;
 }
 
 double PidController::distToRef(const Point2d & p) const
@@ -284,6 +350,18 @@ void PidController::buildPath()
     }
   }
 
+  // 平滑不能切入膨胀障碍；不安全时回退到 A* 的原始折线。
+  for (std::size_t i = 0; i + 1 < pts_.size(); ++i) {
+    if (!safeSegment(pts_[i], pts_[i + 1])) {
+      pts_.clear();
+      for (const auto & pt : raw_pts_) {
+        if (pts_.empty() || std::hypot(pt.x-pts_.back().x, pt.y-pts_.back().y) > 1e-3) {
+          pts_.push_back(pt);
+        }
+      }
+      break;
+    }
+  }
   const std::size_t n = pts_.size();
   s_.resize(n, 0.0);
   for (std::size_t i = 1; i < n; ++i) {
@@ -305,7 +383,8 @@ void PidController::buildPath()
         continue;
       }
       const double cross = (ax * by - ay * bx) / (la * lb);
-      const double ang = std::asin(std::clamp(cross, -1.0, 1.0));
+      const double dot = (ax * bx + ay * by) / (la * lb);
+      const double ang = std::atan2(cross, dot);
       const double kappa = std::fabs(ang) / (0.5 * (la + lb));
       v_lim[i] = std::min(max_linear_vel_, std::sqrt(lat_acc_ / std::max(kappa, 1e-6)));
       continue;
@@ -455,7 +534,7 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
   if (plan_dirty_) {
     buildPath();
   }
-  if (pts_.size() < 2) {
+  if (pts_.size() < 2 || !costmap_) {
     return cmd_vel;
   }
 
@@ -468,7 +547,9 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
   const double dist_end = std::hypot(dx_end, dy_end);
 
   // 已到终点：输出零速（保持停住，不再抖动）
-  if (dist_end < goal_tolerance_) {
+  if (goal_reached_ || (dist_end < goal_tolerance_ &&
+    std::hypot(velocity.linear.x, velocity.linear.y) < 0.08)) {
+    goal_reached_ = true;
     stuck_state_ = 0;
     return cmd_vel;
   }
@@ -522,7 +603,8 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
     const double tan_y = -nx;
     const double v_n_meas = velocity.linear.x * nx + velocity.linear.y * ny;  // 实测横向速度
     double v_n = -(dec_kp_ * e_lat + dec_kd_ * v_n_meas);
-    v_n = std::clamp(v_n, -dec_vmax_, dec_vmax_);
+    const double normal_limit = std::min(dec_vmax_, v_cmd);
+    v_n = std::clamp(v_n, -normal_limit, normal_limit);
     // 切向速度按勾股补偿：横向纠偏不额外拖慢沿路径的前进速度
     const double v_t = std::sqrt(std::max(0.0, v_cmd * v_cmd - v_n * v_n));
     mx = v_t * tan_x + v_n * nx;
@@ -574,12 +656,22 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
     my = std::sin(dir) * v_cmd;
   }
 
+  // 终点独立使用二维位置闭环：投影越过终点后仍能修正纵向误差。
+  // 限制接近速度，防止最小速度和平方根刹车曲线造成反复越过目标。
+  if (s_.back() - s_now < 0.50 && dist_end < 0.60) {
+    mx = 1.4 * dx_end - 0.25 * velocity.linear.x;
+    my = 1.4 * dy_end - 0.25 * velocity.linear.y;
+    const double limit = std::min(0.40, 1.4 * dist_end);
+    const double magnitude = std::hypot(mx, my);
+    if (magnitude > limit) {mx *= limit / magnitude; my *= limit / magnitude;}
+  }
+
   const double cmd_speed = std::hypot(mx, my);
   const double meas_speed = std::hypot(velocity.linear.x, velocity.linear.y);
 
   // ---------- 卡住保护：命令有速度但实际几乎不动 -> 沿路径倒车一下 ----------
   if (stuck_state_ == 0) {
-    if (cmd_speed > 0.50 && meas_speed < 0.08) {
+    if (cmd_speed > 0.15 && meas_speed < 0.04 && dist_end > 0.30) {
       stuck_state_ = 1;
       stuck_since_ = now;
     }
@@ -596,10 +688,12 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
   }
   if (stuck_state_ == 2) {
     if ((now - escape_start_).seconds() < 0.9) {
-      const double bx = pts_[seg + 1].x - pts_[seg].x;
-      const double by = pts_[seg + 1].y - pts_[seg].y;
+      double back_x, back_y;
+      pointAt(std::max(0.0, s_now - 0.30), back_x, back_y);
+      const double bx = x - back_x;
+      const double by = y - back_y;
       const double bn = std::hypot(bx, by);
-      if (bn > 1e-6) {
+      if (bn > 0.03 && safeSegment({x, y}, {back_x, back_y})) {
         const double back = std::atan2(-by, -bx);
         const double c = std::cos(yaw);
         const double s = std::sin(yaw);
@@ -609,10 +703,31 @@ geometry_msgs::msg::TwistStamped PidController::computeVelocityCommands(
         publishMarkers(pose, cmd_vel, yaw);
         return cmd_vel;
       }
+      return cmd_vel;
     } else {
       stuck_state_ = 0;
     }
   }
+
+  // 检查短时响应和随后的停车距离，必要时降低速度。
+  // 使用当前实测速度预测，不能仅检查指令速度，否则制动滞后会撞墙。
+  bool safe = false;
+  for (double scale : {1.0, 0.7, 0.4, 0.0}) {
+    double px = x, py = y;
+    double vx = velocity.linear.x, vy = velocity.linear.y;
+    bool valid = true;
+    for (int k = 0; k < 25; ++k) {
+      const double target_x = k < 10 ? mx * scale : 0.0;
+      const double target_y = k < 10 ? my * scale : 0.0;
+      vx += (target_x - vx) * (0.02 / 0.18);
+      vy += (target_y - vy) * (0.02 / 0.18);
+      px += vx * 0.02;
+      py += vy * 0.02;
+      if (!safePoint(px, py)) {valid = false; break;}
+    }
+    if (valid) {mx *= scale; my *= scale; safe = true; break;}
+  }
+  if (!safe) {mx = 0.0; my = 0.0;}
 
   // map 系速度 -> base_link 系（底盘全向，直接旋转即可）
   const double c = std::cos(yaw);

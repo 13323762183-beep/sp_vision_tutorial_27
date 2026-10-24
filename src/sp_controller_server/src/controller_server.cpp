@@ -63,7 +63,10 @@ ControllerServer::ControllerServer()
     odom_topic_, rclcpp::SensorDataQoS().keep_last(1),
     std::bind(&ControllerServer::onOdometry, this, std::placeholders::_1));
 
-  cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
+  // 运动指令只保留最新样本；过期指令不应在仿真回调恢复后被依次执行。
+  auto command_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+  command_qos.lifespan(rclcpp::Duration::from_seconds(0.15));
+  cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, command_qos);
 
   set_control_enable_srv_ = this->create_service<std_srvs::srv::SetBool>(
     "/set_control_enable",
@@ -188,6 +191,11 @@ void ControllerServer::controlLoop()
   }
 
   if (path_copy.poses.empty()) {
+    cmd_vel_pub_->publish(geometry_msgs::msg::Twist{});
+    return;
+  }
+  if (!control_enabled_.load()) {
+    cmd_vel_pub_->publish(geometry_msgs::msg::Twist{});
     return;
   }
 
@@ -205,6 +213,17 @@ void ControllerServer::controlLoop()
   } catch (const tf2::TransformException & e) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "Failed to get current pose: %s", e.what());
+    cmd_vel_pub_->publish(geometry_msgs::msg::Twist{});
+    return;
+  }
+
+  // lookupTransform(TimePointZero) 会返回最后一帧，即使反馈已停更。
+  // 30 Hz 仿真反馈允许 0.2 s 抖动，超时后停车，避免持续使用过期位姿纠偏。
+  const double pose_age = (this->now() - rclcpp::Time(current_pose.header.stamp)).seconds();
+  if (pose_age > 0.20 || pose_age < -0.05) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "Pose feedback stale (age=%.3f s), stopping.", pose_age);
+    cmd_vel_pub_->publish(geometry_msgs::msg::Twist{});
     return;
   }
 
@@ -223,6 +242,7 @@ void ControllerServer::controlLoop()
   } catch (const std::exception & e) {
     RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "Controller plugin threw exception: %s", e.what());
+    cmd_vel_pub_->publish(geometry_msgs::msg::Twist{});
     return;
   }
 
@@ -245,6 +265,9 @@ void ControllerServer::onSetControlEnable(
   std_srvs::srv::SetBool::Response::SharedPtr response)
 {
   control_enabled_.store(request->data);
+  if (!request->data) {
+    cmd_vel_pub_->publish(geometry_msgs::msg::Twist{});
+  }
   response->success = true;
   response->message = request->data ? "Control enabled" : "Control disabled";
   RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
