@@ -19,7 +19,7 @@ public:
   {
     this->declare_parameter("reliability", "reliable");
     this->declare_parameter("depth", 10);
-    this->declare_parameter("callback_delay_ms", 30);
+    this->declare_parameter("callback_delay_ms", 0);
 
     reliability_ = this->get_parameter("reliability").as_string();
     depth_ = this->get_parameter("depth").as_int();
@@ -96,6 +96,8 @@ private:
     else if (msg->seq > expected_seq_)
     {
       const uint32_t lost = msg->seq - expected_seq_;
+      lost_count_ += lost;
+
       RCLCPP_WARN(
           this->get_logger(),
           "检测到丢包: 期望 seq=%u, 实际 seq=%u, 丢失 %u 条",
@@ -120,19 +122,44 @@ private:
   }
 
   void report()
-  {
-    const uint64_t total = static_cast<uint64_t>(received_count_) + lost_count_;
-    const double loss_rate = (total == 0) ? 0.0 : 100.0 * lost_count_ / total;
-    RCLCPP_INFO(
-        this->get_logger(),
-        "累计: 收到 %u 条, 丢失 %u 条, 丢包率 %.2f%%",
-        received_count_, lost_count_, loss_rate);
+{
+  const uint64_t total =
+      static_cast<uint64_t>(received_count_) + lost_count_;
 
-    /*
-    在这之间加入计算帧率并打印的代码
+  const double loss_rate =
+      (total == 0) ? 0.0 : 100.0 * lost_count_ / total;
 
-    */
-  }
+  RCLCPP_INFO(
+      this->get_logger(),
+      "累计: 收到 %u 条, 丢失 %u 条, 丢包率 %.2f%%",
+      received_count_, lost_count_, loss_rate);
+
+  // 获取当前时间
+  const auto now = std::chrono::steady_clock::now();
+
+  // 计算距离上次统计经过的时间（秒）
+  const double elapsed =
+      std::chrono::duration<double>(
+          now - last_report_time_).count();
+
+  // 计算这段时间内新增的接收消息数量
+  const uint32_t received_delta =
+      received_count_ - last_received_count_;
+
+  // 计算实际接收帧率
+  const double fps =
+      (elapsed > 0.0) ? received_delta / elapsed : 0.0;
+
+  // 打印帧率
+  RCLCPP_INFO(
+      this->get_logger(),
+      "接收帧率: %.2f FPS",
+      fps);
+
+  // 更新统计基准，供下一次计算使用
+  last_received_count_ = received_count_;
+  last_report_time_ = now;
+}
 
   rclcpp::Subscription<nav_hw_interfaces::msg::SensorData>::SharedPtr subscription_;
   rclcpp::TimerBase::SharedPtr report_timer_;
