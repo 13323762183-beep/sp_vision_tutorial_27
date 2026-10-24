@@ -5,8 +5,10 @@
 #include "image_processor.hpp"
 #include "statistics.hpp"
 
+#include <exception>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -33,6 +35,8 @@ public:
 private:
     void producerLoop();
     void workerLoop(int worker_id);
+    void joinThreads() noexcept;
+    void recordError(std::exception_ptr error) noexcept;
 
     std::unique_ptr<FrameSource> source_;
     PipelineConfig config_;
@@ -41,4 +45,7 @@ private:
     Statistics statistics_;
     std::thread producer_;
     std::vector<std::thread> workers_;
+    bool started_ = false;
+    mutable std::mutex error_mutex_;
+    std::exception_ptr first_error_;
 };

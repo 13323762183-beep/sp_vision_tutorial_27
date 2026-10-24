@@ -14,7 +14,6 @@ namespace
 {
     std::mutex output_mutex;
 
-    // A simple thread-safe log output helper function
     void logLine(std::ostream &output, const std::string &message)
     {
         std::lock_guard<std::mutex> lock(output_mutex);
@@ -37,28 +36,46 @@ Pipeline::Pipeline(std::unique_ptr<FrameSource> source, PipelineConfig config)
 
 Pipeline::~Pipeline()
 {
-    // TODO: Make sure Pipeline never destroys running threads.
+    // Destruction without an explicit wait() must still join all threads.
+    joinThreads();
 }
 
 void Pipeline::start()
 {
-    std::filesystem::create_directories(config_.output_directory);
-    workers_.reserve(static_cast<std::size_t>(config_.worker_count));
-    for (int i = 0; i < config_.worker_count; ++i)
+    if (started_)
     {
-        workers_.emplace_back([this, i]
-                              { workerLoop(i); });
+        throw std::logic_error("Pipeline::start() may only be called once");
     }
-    producer_ = std::thread([this]
-                            { producerLoop(); });
+    started_ = true;
+    try
+    {
+        std::filesystem::create_directories(config_.output_directory);
+        workers_.reserve(static_cast<std::size_t>(config_.worker_count));
+        for (int i = 0; i < config_.worker_count; ++i)
+        {
+            workers_.emplace_back([this, i]
+                                  { workerLoop(i); });
+        }
+        producer_ = std::thread([this]
+                                { producerLoop(); });
+    }
+    catch (...)
+    {
+        // Worker threads may already be waiting for a queue item.
+        queue_.close();
+        joinThreads();
+        throw;
+    }
 }
 
-void Pipeline::wait()
+void Pipeline::joinThreads() noexcept
 {
     if (producer_.joinable())
     {
         producer_.join();
     }
+    // All pending queue elements remain available to workers after close().
+    queue_.close();
     for (auto &worker : workers_)
     {
         if (worker.joinable())
@@ -68,6 +85,30 @@ void Pipeline::wait()
     }
 }
 
+void Pipeline::wait()
+{
+    joinThreads();
+    std::exception_ptr error;
+    {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        error = first_error_;
+    }
+    if (error)
+    {
+        std::rethrow_exception(error);
+    }
+}
+
+void Pipeline::recordError(std::exception_ptr error) noexcept
+{
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    if (!first_error_)
+    {
+        first_error_ = error;
+    }
+    queue_.close();
+}
+
 StatisticsSnapshot Pipeline::statistics() const
 {
     return statistics_.snapshot();
@@ -75,50 +116,63 @@ StatisticsSnapshot Pipeline::statistics() const
 
 void Pipeline::producerLoop()
 {
-    Frame frame;
-    while (source_->next(frame))
+    try
     {
-        statistics_.onProduced();
-        logLine(std::cout, "[Producer] frame " + std::to_string(frame.id));
-
-        // What's the best way to write this?
-        queue_.push(frame);
+        Frame frame;
+        while (source_->next(frame))
+        {
+            statistics_.onProduced();
+            logLine(std::cout, "[Producer] frame " + std::to_string(frame.id));
+            queue_.push(std::move(frame));
+            frame = Frame{};
+        }
+    }
+    catch (...)
+    {
+        recordError(std::current_exception());
     }
     queue_.close();
 }
 
 void Pipeline::workerLoop(int worker_id)
 {
-    Frame frame;
-    while (queue_.pop(frame))
+    try
     {
-        if (config_.worker_delay_ms > 0)
+        Frame frame;
+        while (queue_.pop(frame))
         {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(config_.worker_delay_ms));
-        }
+            if (config_.worker_delay_ms > 0)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(config_.worker_delay_ms));
+            }
 
-        if (checksum(frame.image) != frame.expected_checksum)
-        {
-            statistics_.onCorrupted();
-            logLine(std::cerr,
-                    "[Worker " + std::to_string(worker_id) + "] ERROR: frame " +
-                        std::to_string(frame.id) + " data changed before processing");
-            continue;
-        }
+            if (checksum(frame.image) != frame.expected_checksum)
+            {
+                statistics_.onCorrupted();
+                logLine(std::cerr,
+                        "[Worker " + std::to_string(worker_id) + "] ERROR: frame " +
+                            std::to_string(frame.id) + " data changed before processing");
+                continue;
+            }
 
-        logLine(std::cout,
-                "[Worker " + std::to_string(worker_id) + "] processing frame " +
-                    std::to_string(frame.id));
-        const cv::Mat output = processor_.process(frame);
-        statistics_.onProcessed();
+            logLine(std::cout,
+                    "[Worker " + std::to_string(worker_id) + "] processing frame " +
+                        std::to_string(frame.id));
+            const cv::Mat output = processor_.process(frame);
+            statistics_.onProcessed();
 
-        std::ostringstream filename;
-        filename << std::setw(3) << std::setfill('0') << frame.id << ".jpg";
-        const auto name = filename.str();
-        if (cv::imwrite((config_.output_directory / name).string(), output))
-        {
-            statistics_.onSaved();
+            std::ostringstream filename;
+            filename << std::setw(3) << std::setfill('0') << frame.id << ".jpg";
+            const auto name = filename.str();
+            if (cv::imwrite((config_.output_directory / name).string(), output))
+            {
+                statistics_.onSaved();
+            }
         }
+    }
+    catch (...)
+    {
+        recordError(std::current_exception());
     }
 }

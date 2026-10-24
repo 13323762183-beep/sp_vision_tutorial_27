@@ -1,25 +1,33 @@
 #include "statistics.hpp"
 
-#include <chrono>
-#include <thread>
+#include <mutex>
 
-namespace
+void Statistics::onProduced()
 {
-    void deliberatelySlowIncrement(int &value)
-    {
-        // This delay makes the race observable on small homework inputs.
-        const int old = value;
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-        value = old + 1;
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++produced_;
 }
 
-void Statistics::onProduced() { deliberatelySlowIncrement(produced_); }
-void Statistics::onProcessed() { deliberatelySlowIncrement(processed_); }
-void Statistics::onSaved() { deliberatelySlowIncrement(saved_); }
-void Statistics::onCorrupted() { deliberatelySlowIncrement(corrupted_); }
+void Statistics::onProcessed()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++processed_;
+}
+
+void Statistics::onSaved()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++saved_;
+}
+
+void Statistics::onCorrupted()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++corrupted_;
+}
 
 StatisticsSnapshot Statistics::snapshot() const
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     return {produced_, processed_, saved_, corrupted_};
 }
