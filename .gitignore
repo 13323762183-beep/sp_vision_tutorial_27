@@ -8,3 +8,4 @@ log
 compile_commands.json
 src/sp_nav_sim/sp_nav_sim/sim/dyn_core.c
 作业要求.md
+/tests/
