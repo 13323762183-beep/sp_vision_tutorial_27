@@ -25,15 +25,40 @@ int main()
             // 3. YOLO 检测装甲板
             auto armors = yolo.detect(img);
 
-            // 4. 绘制装甲板四个关键点形成的绿色矩形
-            for (const auto& armor : armors) {
-                tools::draw_points(
-                    img,
-                    armor.points,
-                    cv::Scalar(0, 255, 0),
-                    2
-                );
-            }
+            
+            // 4. 绘制绿色矩形框，并在上方显示颜色和图案
+        for (const auto& armor : armors) {
+
+            // 绘制绿色矩形框
+            tools::draw_points(
+                img,
+                armor.points,
+                cv::Scalar(0, 255, 0),
+                2
+            );
+
+            // 获取颜色和图案
+            std::string info =
+                auto_aim::COLORS.at(armor.color) + " " +
+                auto_aim::ARMOR_NAMES.at(armor.name);
+
+            // 获取矩形框左上角
+            int x = armor.box.x;
+            int y = armor.box.y;
+
+            // 在矩形框上方显示文字
+            cv::putText(
+                img,
+                info,
+                cv::Point(x, std::max(20, y - 10)),
+                cv::FONT_HERSHEY_SIMPLEX,
+                0.6,
+                cv::Scalar(0, 255, 0),
+                2
+            );
+        }
+
+
 
             // 5. 显示图像
             cv::imshow("Armor Detection", img);

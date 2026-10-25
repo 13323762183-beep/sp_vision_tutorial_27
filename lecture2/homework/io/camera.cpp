@@ -51,48 +51,14 @@ Camera::Camera()
         );
         opened_ = true;
 
-        // 4. 设置相机参数
-        check(
-            MV_CC_SetEnumValue(
-                handle_,
-                "BalanceWhiteAuto",
-                MV_BALANCEWHITE_AUTO_CONTINUOUS
-            ),
-            "Set BalanceWhiteAuto"
-        );
 
-        check(
-            MV_CC_SetEnumValue(
-                handle_,
-                "ExposureAuto",
-                MV_EXPOSURE_AUTO_MODE_OFF
-            ),
-            "Set ExposureAuto"
-        );
+        MV_CC_SetEnumValue(handle_, "BalanceWhiteAuto", MV_BALANCEWHITE_AUTO_CONTINUOUS);
+        MV_CC_SetEnumValue(handle_, "ExposureAuto", MV_EXPOSURE_AUTO_MODE_OFF);
+        MV_CC_SetEnumValue(handle_, "GainAuto", MV_GAIN_MODE_OFF);
+        MV_CC_SetFloatValue(handle_, "ExposureTime", 2000);
+        MV_CC_SetFloatValue(handle_, "Gain", 10);
+        MV_CC_SetFrameRate(handle_, 60);
 
-        check(
-            MV_CC_SetEnumValue(
-                handle_,
-                "GainAuto",
-                MV_GAIN_MODE_OFF
-            ),
-            "Set GainAuto"
-        );
-
-        check(
-            MV_CC_SetFloatValue(handle_, "ExposureTime", 10000),
-            "Set ExposureTime"
-        );
-
-        check(
-            MV_CC_SetFloatValue(handle_, "Gain", 20),
-            "Set Gain"
-        );
-
-        check(
-            MV_CC_SetFrameRate(handle_, 60),
-            "Set FrameRate"
-        );
 
         // 5. 开始采集
         check(
