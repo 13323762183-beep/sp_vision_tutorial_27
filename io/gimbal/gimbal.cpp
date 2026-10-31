@@ -1,3 +1,7 @@
+//std::lock_guard<std::mutex> lock(mutex_);是什么意思？干什么的？`std::lock_guard<std::mutex> lock(mutex_);
+//（？） 是 C++ 中用于线程同步的一种机制。它的作用是确保在多线程环境下对共享资源的访问是安全的，防止数据竞争和不一致性。
+
+
 #include "gimbal.hpp"
 
 #include <chrono>
